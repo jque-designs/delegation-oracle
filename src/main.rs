@@ -173,7 +173,17 @@ async fn main() -> Result<()> {
     config.apply_overrides(ConfigOverrides {
         vote_pubkey: cli.validator.clone(),
         rpc_url: cli.rpc.clone(),
-        enabled_programs: cli.programs.as_ref().map(parse_program_list).transpose()?,
+        enabled_programs: cli
+            .programs
+            .as_ref()
+            .map(|raw| {
+                parse_program_list(raw.as_str()).map(|ids| {
+                    ids.into_iter()
+                        .map(|id| id.as_slug().to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .transpose()?,
     });
     let selected_programs = resolve_selected_programs(&config, cli.programs.as_deref())?;
 

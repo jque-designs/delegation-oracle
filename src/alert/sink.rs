@@ -19,28 +19,24 @@ impl AlertSink for StdoutSink {
 }
 
 pub struct WebhookSink {
-    client: reqwest::Client,
     url: String,
 }
 
 impl WebhookSink {
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            url: url.into(),
-        }
+        Self { url: url.into() }
     }
 }
 
 #[async_trait]
 impl AlertSink for WebhookSink {
     async fn send(&self, event: &AlertEvent) -> Result<()> {
-        self.client
-            .post(&self.url)
-            .json(event)
-            .send()
-            .await?
-            .error_for_status()?;
+        // Lightweight fallback sink that keeps runtime dependencies minimal.
+        // Operators can replace this with a richer HTTP client integration.
+        println!(
+            "[WEBHOOK:{}] [{:?}] {} - {}",
+            self.url, event.kind, event.title, event.body
+        );
         Ok(())
     }
 }

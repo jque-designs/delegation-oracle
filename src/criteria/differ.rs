@@ -168,3 +168,39 @@ pub fn textual_diff(old_set: &CriteriaSet, new_set: &CriteriaSet) -> String {
 fn format_constraint(constraint: &Constraint) -> String {
     constraint.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::criteria::differ::{diff_criteria, ChangeType};
+    use crate::criteria::{Constraint, CriteriaSet, Criterion, MetricKey, ProgramId};
+
+    #[test]
+    fn detects_threshold_changes() {
+        let old_set = CriteriaSet::with_hash(
+            ProgramId::Jito,
+            "old",
+            vec![Criterion {
+                name: "mev".to_string(),
+                metric: MetricKey::MevCommission,
+                constraint: Constraint::Max(8.0),
+                weight: Some(1.0),
+                description: "old".to_string(),
+            }],
+        );
+        let new_set = CriteriaSet::with_hash(
+            ProgramId::Jito,
+            "new",
+            vec![Criterion {
+                name: "mev".to_string(),
+                metric: MetricKey::MevCommission,
+                constraint: Constraint::Max(6.0),
+                weight: Some(1.0),
+                description: "old".to_string(),
+            }],
+        );
+        let changes = diff_criteria(&old_set, &new_set);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c.change_type, ChangeType::ThresholdChanged)));
+    }
+}

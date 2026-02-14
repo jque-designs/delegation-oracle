@@ -122,3 +122,41 @@ fn compare_constraints(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::criteria::{Constraint, CriteriaSet, Criterion, MetricKey, ProgramId};
+    use crate::optimizer::conflicts::detect_conflicts;
+    use crate::optimizer::ConflictType;
+
+    #[test]
+    fn detects_direct_contradiction() {
+        let set_a = CriteriaSet::with_hash(
+            ProgramId::Sfdp,
+            "a",
+            vec![Criterion {
+                name: "commission".to_string(),
+                metric: MetricKey::Commission,
+                constraint: Constraint::Max(3.0),
+                weight: None,
+                description: String::new(),
+            }],
+        );
+        let set_b = CriteriaSet::with_hash(
+            ProgramId::Marinade,
+            "b",
+            vec![Criterion {
+                name: "commission-floor".to_string(),
+                metric: MetricKey::Commission,
+                constraint: Constraint::Min(5.0),
+                weight: None,
+                description: String::new(),
+            }],
+        );
+
+        let conflicts = detect_conflicts(&[set_a, set_b]);
+        assert!(conflicts
+            .iter()
+            .any(|c| c.conflict_type == ConflictType::DirectContradiction));
+    }
+}

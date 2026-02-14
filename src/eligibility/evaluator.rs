@@ -159,3 +159,56 @@ pub fn estimate_effort(metric: &MetricKey, delta: f64, required: f64) -> EffortL
         MetricKey::Custom(_) => EffortLevel::Moderate,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::criteria::{Constraint, CriteriaSet, Criterion, MetricKey, ProgramId};
+    use crate::eligibility::evaluator::evaluate_validator;
+    use crate::metrics::ValidatorMetrics;
+
+    #[test]
+    fn evaluator_flags_failed_min_constraints() {
+        let validator = ValidatorMetrics::sample("TestVote");
+        let criteria = CriteriaSet::with_hash(
+            ProgramId::Sfdp,
+            "test",
+            vec![Criterion {
+                name: "stake floor".to_string(),
+                metric: MetricKey::ActivatedStake,
+                constraint: Constraint::Min(200_000.0),
+                weight: None,
+                description: String::new(),
+            }],
+        );
+
+        let result = evaluate_validator(ProgramId::Sfdp, &validator, &criteria, Some(10_000.0));
+        assert!(!result.eligible);
+        assert_eq!(result.failed_count(), 1);
+        let gap = result.criterion_results[0]
+            .gap
+            .as_ref()
+            .expect("missing gap");
+        assert!(gap.delta > 0.0);
+    }
+
+    #[test]
+    fn evaluator_marks_passed_constraints_eligible() {
+        let mut validator = ValidatorMetrics::sample("TestVote");
+        validator.commission = 3.0;
+        let criteria = CriteriaSet::with_hash(
+            ProgramId::Sfdp,
+            "test",
+            vec![Criterion {
+                name: "commission".to_string(),
+                metric: MetricKey::Commission,
+                constraint: Constraint::Max(5.0),
+                weight: None,
+                description: String::new(),
+            }],
+        );
+
+        let result = evaluate_validator(ProgramId::Sfdp, &validator, &criteria, Some(8_000.0));
+        assert!(result.eligible);
+        assert_eq!(result.failed_count(), 0);
+    }
+}
