@@ -6,11 +6,13 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -196,6 +198,33 @@ struct WatchRequest {
     iterations: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ThreatsQuery {
+    validator: Option<String>,
+    rpc: Option<String>,
+    programs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct OpportunitiesQuery {
+    validator: Option<String>,
+    rpc: Option<String>,
+    programs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct QueueQuery {
+    validator: Option<String>,
+    pool: Option<String>,
+    rpc: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CohortsQuery {
+    validator: Option<String>,
+    epochs: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -247,6 +276,78 @@ struct WatchResponse {
     iterations: Vec<WatchIteration>,
 }
 
+#[derive(Debug, Serialize)]
+struct RouteDoc {
+    method: &'static str,
+    path: &'static str,
+    description: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DocsResponse {
+    routes: Vec<RouteDoc>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgramThreat {
+    program: ProgramId,
+    eligible: bool,
+    failed_criteria: usize,
+    risk_score: f64,
+    threat_level: &'static str,
+    estimated_stake_at_risk_sol: f64,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreatAssessment {
+    validator: String,
+    assessed_at: chrono::DateTime<Utc>,
+    overall_risk_score: f64,
+    threats: Vec<ProgramThreat>,
+}
+
+#[derive(Debug, Serialize)]
+struct DecayOpportunity {
+    program: ProgramId,
+    vulnerable_validators: usize,
+    redistributable_stake_sol: f64,
+    top_targets: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpportunitiesResponse {
+    opportunities: Vec<DecayOpportunity>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueResponse {
+    validator: String,
+    pool: ProgramId,
+    position: Option<usize>,
+    total: usize,
+    percentile: Option<f64>,
+    eligible: bool,
+    estimated_delegation_sol: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgramCohortFlow {
+    program: ProgramId,
+    samples: usize,
+    eligible_ratio: f64,
+    gain_events: usize,
+    loss_events: usize,
+    avg_delegation_sol: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CohortsResponse {
+    validator: String,
+    lookback_records: usize,
+    cohorts: Vec<ProgramCohortFlow>,
+}
+
 pub async fn run_server(config: Config, bind: SocketAddr) -> Result<()> {
     let state = ApiState {
         db_path: config.resolved_db_path(),
@@ -256,6 +357,12 @@ pub async fn run_server(config: Config, bind: SocketAddr) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/health", get(api_health))
+        .route("/api/docs", get(api_docs))
+        .route("/api/threats", get(api_threats))
+        .route("/api/opportunities", get(api_opportunities))
+        .route("/api/queue", get(api_queue))
+        .route("/api/cohorts", get(api_cohorts))
         .route("/v1/status", post(status))
         .route("/v1/gaps", post(gaps))
         .route("/v1/arbitrage", post(arbitrage))
@@ -266,7 +373,8 @@ pub async fn run_server(config: Config, bind: SocketAddr) -> Result<()> {
         .route("/v1/optimize", post(optimize))
         .route("/v1/watch", post(watch))
         .route("/v1/config", get(show_config))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn(cors_middleware));
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("REST API listening on http://{bind}");
@@ -280,6 +388,311 @@ async fn health() -> Json<ApiResponse<HealthResponse>> {
 
 async fn show_config(State(state): State<ApiState>) -> Json<ApiResponse<Config>> {
     ok(state.config)
+}
+
+async fn api_health() -> Json<ApiResponse<HealthResponse>> {
+    ok(HealthResponse { status: "ok" })
+}
+
+async fn api_docs() -> Json<ApiResponse<DocsResponse>> {
+    ok(DocsResponse {
+        routes: vec![
+            RouteDoc {
+                method: "GET",
+                path: "/api/health",
+                description: "Basic health check",
+            },
+            RouteDoc {
+                method: "GET",
+                path: "/api/docs",
+                description: "List available API routes",
+            },
+            RouteDoc {
+                method: "GET",
+                path: "/api/threats?validator=<pubkey>",
+                description: "Threat assessment for validator across programs",
+            },
+            RouteDoc {
+                method: "GET",
+                path: "/api/opportunities",
+                description: "Decay opportunities from vulnerable validator cohorts",
+            },
+            RouteDoc {
+                method: "GET",
+                path: "/api/queue?validator=<pubkey>&pool=<pool>",
+                description: "Stake pool queue position for validator",
+            },
+            RouteDoc {
+                method: "GET",
+                path: "/api/cohorts",
+                description: "Cohort flow analysis from eligibility history",
+            },
+        ],
+    })
+}
+
+async fn api_threats(
+    State(state): State<ApiState>,
+    Query(query): Query<ThreatsQuery>,
+) -> ApiResult<ThreatAssessment> {
+    let validator = query
+        .validator
+        .ok_or_else(|| ApiError::bad_request("validator query parameter is required"))?;
+    let context = context_from_query(
+        &state,
+        Some(validator.clone()),
+        query.rpc,
+        query.programs,
+        MetricOverrides::default(),
+    )?;
+    let metrics = collect_metrics(&context).await?;
+    let (results, _, estimate_by_program) =
+        evaluate_selected_programs(&state.registry, &context.programs, &metrics).await?;
+
+    let threats = results
+        .iter()
+        .map(|result| {
+            let failed = result.failed_count();
+            let risk_score = if !result.eligible {
+                (0.70 + (failed as f64 * 0.08)).min(1.0)
+            } else if failed > 0 {
+                0.45
+            } else {
+                0.12
+            };
+            let threat_level = if risk_score >= 0.7 {
+                "high"
+            } else if risk_score >= 0.35 {
+                "moderate"
+            } else {
+                "low"
+            };
+            let notes = result
+                .criterion_results
+                .iter()
+                .filter(|criterion| !criterion.passed)
+                .map(|criterion| criterion.criterion_name.clone())
+                .collect::<Vec<_>>();
+            ProgramThreat {
+                program: result.program,
+                eligible: result.eligible,
+                failed_criteria: failed,
+                risk_score,
+                threat_level,
+                estimated_stake_at_risk_sol: if result.eligible {
+                    0.0
+                } else {
+                    estimate_by_program
+                        .get(&result.program)
+                        .copied()
+                        .unwrap_or(0.0)
+                },
+                notes,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let overall_risk_score = if threats.is_empty() {
+        0.0
+    } else {
+        threats.iter().map(|t| t.risk_score).sum::<f64>() / threats.len() as f64
+    };
+
+    Ok(ok(ThreatAssessment {
+        validator,
+        assessed_at: Utc::now(),
+        overall_risk_score,
+        threats,
+    }))
+}
+
+async fn api_opportunities(
+    State(state): State<ApiState>,
+    Query(query): Query<OpportunitiesQuery>,
+) -> ApiResult<OpportunitiesResponse> {
+    let context = context_from_query(
+        &state,
+        query.validator,
+        query.rpc,
+        query.programs,
+        MetricOverrides::default(),
+    )?;
+    let metrics = collect_metrics(&context).await?;
+    let (_, criteria_sets, _) =
+        evaluate_selected_programs(&state.registry, &context.programs, &metrics).await?;
+    let competitors = sample_competitors(&metrics);
+
+    let mut opportunities = Vec::new();
+    for criteria in &criteria_sets {
+        let vulnerabilities = analyze_vulnerabilities(
+            criteria.program,
+            criteria,
+            &competitors,
+            state.config.analysis.vulnerability_margin_pct,
+        );
+        if vulnerabilities.is_empty() {
+            continue;
+        }
+        let redistributable_stake_sol = vulnerabilities
+            .iter()
+            .map(|item| item.current_delegation_sol)
+            .sum::<f64>();
+        let top_targets = vulnerabilities
+            .iter()
+            .take(3)
+            .map(|item| item.vote_pubkey.clone())
+            .collect::<Vec<_>>();
+        opportunities.push(DecayOpportunity {
+            program: criteria.program,
+            vulnerable_validators: vulnerabilities.len(),
+            redistributable_stake_sol,
+            top_targets,
+        });
+    }
+    opportunities.sort_by(|a, b| {
+        b.redistributable_stake_sol
+            .total_cmp(&a.redistributable_stake_sol)
+    });
+
+    Ok(ok(OpportunitiesResponse { opportunities }))
+}
+
+async fn api_queue(
+    State(state): State<ApiState>,
+    Query(query): Query<QueueQuery>,
+) -> ApiResult<QueueResponse> {
+    let validator = query
+        .validator
+        .ok_or_else(|| ApiError::bad_request("validator query parameter is required"))?;
+    let pool = query
+        .pool
+        .ok_or_else(|| ApiError::bad_request("pool query parameter is required"))?;
+    let pool_id = ProgramId::from_str(&pool).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let context = context_from_query(
+        &state,
+        Some(validator.clone()),
+        query.rpc,
+        Some(pool_id.as_slug().to_string()),
+        MetricOverrides::default(),
+    )?;
+    let metrics = collect_metrics(&context).await?;
+
+    let program = state
+        .registry
+        .by_id(pool_id)
+        .ok_or_else(|| ApiError::bad_request("unknown pool identifier"))?;
+    let criteria = program.fetch_criteria().await.map_err(ApiError::internal)?;
+    let result = program.evaluate(&metrics, &criteria);
+    let mut eligible_set = program
+        .fetch_eligible_set()
+        .await
+        .map_err(ApiError::internal)?;
+    eligible_set.sort_by(|a, b| {
+        b.delegated_sol
+            .unwrap_or(0.0)
+            .total_cmp(&a.delegated_sol.unwrap_or(0.0))
+            .then_with(|| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)))
+    });
+
+    let total = eligible_set.len();
+    let position = eligible_set
+        .iter()
+        .position(|item| item.vote_pubkey == validator)
+        .map(|idx| idx + 1);
+    let percentile = position.map(|pos| {
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * ((total.saturating_sub(pos) + 1) as f64 / total as f64)
+        }
+    });
+
+    Ok(ok(QueueResponse {
+        validator,
+        pool: pool_id,
+        position,
+        total,
+        percentile,
+        eligible: result.eligible,
+        estimated_delegation_sol: result.estimated_delegation_sol,
+    }))
+}
+
+async fn api_cohorts(
+    State(state): State<ApiState>,
+    Query(query): Query<CohortsQuery>,
+) -> ApiResult<CohortsResponse> {
+    let configured_validator = query
+        .validator
+        .unwrap_or_else(|| state.config.validator.vote_pubkey.clone());
+    let validator = if configured_validator.trim().is_empty() {
+        "DemoVote11111111111111111111111111111111111".to_string()
+    } else {
+        configured_validator
+    };
+    let lookback = query
+        .epochs
+        .unwrap_or(state.config.analysis.lookback_epochs as usize)
+        .max(1);
+    let history_limit = lookback.saturating_mul(ProgramId::ALL.len()).max(10);
+
+    let store = open_store(&state)?;
+    let records = store
+        .load_history(&validator, None, history_limit)
+        .map_err(ApiError::internal)?;
+
+    let mut grouped: BTreeMap<ProgramId, Vec<EligibilityRecord>> = BTreeMap::new();
+    for record in records.clone() {
+        grouped.entry(record.program).or_default().push(record);
+    }
+
+    let mut cohorts = Vec::new();
+    for (program, mut program_records) in grouped {
+        program_records.sort_by_key(|record| record.epoch);
+        let samples = program_records.len();
+        if samples == 0 {
+            continue;
+        }
+        let eligible_count = program_records
+            .iter()
+            .filter(|record| record.eligible)
+            .count();
+        let eligible_ratio = eligible_count as f64 / samples as f64;
+        let avg_delegation_sol = program_records
+            .iter()
+            .filter_map(|record| record.delegation_sol)
+            .sum::<f64>()
+            / samples as f64;
+
+        let mut gain_events = 0usize;
+        let mut loss_events = 0usize;
+        for window in program_records.windows(2) {
+            if let [prev, next] = window {
+                if !prev.eligible && next.eligible {
+                    gain_events += 1;
+                } else if prev.eligible && !next.eligible {
+                    loss_events += 1;
+                }
+            }
+        }
+
+        cohorts.push(ProgramCohortFlow {
+            program,
+            samples,
+            eligible_ratio,
+            gain_events,
+            loss_events,
+            avg_delegation_sol,
+        });
+    }
+    cohorts.sort_by(|a, b| b.eligible_ratio.total_cmp(&a.eligible_ratio));
+
+    Ok(ok(CohortsResponse {
+        validator,
+        lookback_records: records.len(),
+        cohorts,
+    }))
 }
 
 async fn status(
@@ -440,8 +853,8 @@ async fn drift(
         &effective.programs,
         &metrics,
     )
-        .await
-        .map_err(ApiError::internal)?;
+    .await
+    .map_err(ApiError::internal)?;
     Ok(ok(DriftResponse { drifts }))
 }
 
@@ -560,8 +973,8 @@ async fn watch(
                 &effective.programs,
                 &live_metrics,
             )
-                .await
-                .map_err(ApiError::internal)?
+            .await
+            .map_err(ApiError::internal)?
         } else {
             Vec::new()
         };
@@ -603,6 +1016,28 @@ fn default_true() -> bool {
     true
 }
 
+async fn cors_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        return add_cors_headers((StatusCode::NO_CONTENT, "").into_response());
+    }
+    let response = next.run(req).await;
+    add_cors_headers(response)
+}
+
+fn add_cors_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("*"),
+    );
+    response
+}
+
 fn open_store(state: &ApiState) -> std::result::Result<SnapshotStore, ApiError> {
     SnapshotStore::open(&state.db_path).map_err(ApiError::internal)
 }
@@ -638,6 +1073,39 @@ fn resolve_effective_context(
         programs,
         metrics: context.metrics.clone(),
     })
+}
+
+fn context_from_query(
+    state: &ApiState,
+    validator: Option<String>,
+    rpc: Option<String>,
+    programs_csv: Option<String>,
+    metrics: MetricOverrides,
+) -> std::result::Result<EffectiveContext, ApiError> {
+    let programs = if let Some(raw) = programs_csv {
+        let entries = raw
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    } else {
+        None
+    };
+
+    resolve_effective_context(
+        state,
+        &CommandContextRequest {
+            validator,
+            rpc_url: rpc,
+            programs,
+            metrics,
+        },
+    )
 }
 
 fn parse_programs(raw_programs: &[String]) -> std::result::Result<Vec<ProgramId>, ApiError> {

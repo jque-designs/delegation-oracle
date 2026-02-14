@@ -162,8 +162,10 @@ enum Commands {
         iterations: u32,
     },
     Serve {
-        #[arg(long, default_value = "127.0.0.1:3000")]
-        bind: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 3001)]
+        port: u16,
     },
     Config {
         #[arg(long)]
@@ -200,7 +202,8 @@ async fn main() -> Result<()> {
     if matches!(cli.command, Commands::Config { .. }) {
         return handle_config_command(&cli.command, &config, &config_path);
     }
-    if let Commands::Serve { bind } = &cli.command {
+    if let Commands::Serve { host, port } = &cli.command {
+        let bind = format!("{host}:{port}");
         let addr: SocketAddr = bind
             .parse()
             .map_err(|e| anyhow!("invalid bind address {bind}: {e}"))?;
