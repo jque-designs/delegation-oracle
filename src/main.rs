@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -33,6 +34,7 @@ use delegation_oracle::output::table::{
     render_whatif_table,
 };
 use delegation_oracle::programs::ProgramRegistry;
+use delegation_oracle::server::run_server;
 use delegation_oracle::snapshot::store::SnapshotStore;
 use tracing::{info, warn};
 
@@ -159,6 +161,10 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         iterations: u32,
     },
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+    },
     Config {
         #[arg(long)]
         init: bool,
@@ -193,6 +199,12 @@ async fn main() -> Result<()> {
 
     if matches!(cli.command, Commands::Config { .. }) {
         return handle_config_command(&cli.command, &config, &config_path);
+    }
+    if let Commands::Serve { bind } = &cli.command {
+        let addr: SocketAddr = bind
+            .parse()
+            .map_err(|e| anyhow!("invalid bind address {bind}: {e}"))?;
+        return run_server(config, addr).await;
     }
 
     let registry = ProgramRegistry::with_defaults();
@@ -339,6 +351,7 @@ async fn main() -> Result<()> {
             .await?;
         }
         Commands::Config { .. } => {}
+        Commands::Serve { .. } => unreachable!("serve command handled before dispatch"),
     }
 
     Ok(())

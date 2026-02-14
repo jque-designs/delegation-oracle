@@ -175,6 +175,38 @@ impl Display for MetricKey {
     }
 }
 
+#[derive(Debug, Error)]
+#[error("unknown metric key: {0}")]
+pub struct MetricKeyParseError(pub String);
+
+impl FromStr for MetricKey {
+    type Err = MetricKeyParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+        let key = match normalized.as_str() {
+            "commission" => MetricKey::Commission,
+            "activated_stake" | "stake" | "active_stake" => MetricKey::ActivatedStake,
+            "skip_rate" => MetricKey::SkipRate,
+            "vote_credits" | "credits" => MetricKey::VoteCredits,
+            "uptime_percent" | "uptime" => MetricKey::UptimePercent,
+            "solana_version" | "version" => MetricKey::SolanaVersion,
+            "datacenter_concentration" | "dc_concentration" => MetricKey::DatacenterConcentration,
+            "superminority_status" | "superminority" => MetricKey::SuperminorityStatus,
+            "mev_commission" => MetricKey::MevCommission,
+            "stake_concentration" => MetricKey::StakeConcentration,
+            "infrastructure_diversity" | "infra_diversity" => MetricKey::InfrastructureDiversity,
+            _ => {
+                if normalized.is_empty() {
+                    return Err(MetricKeyParseError(s.to_string()));
+                }
+                MetricKey::Custom(normalized)
+            }
+        };
+        Ok(key)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricValue {
