@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use delegation_oracle::alert::engine::evaluate_alerts;
+use delegation_oracle::alert::rules::AlertEventKind;
 use delegation_oracle::alert::sink::{AlertSink, StdoutSink, WebhookSink};
 use delegation_oracle::config::{Config, ConfigOverrides};
-use delegation_oracle::criteria::fetcher::fetch_all_criteria;
 use delegation_oracle::criteria::{build_drift_report, CriteriaDrift, MetricKey, ProgramId};
 use delegation_oracle::eligibility::arbitrage::build_arbitrage_opportunities;
 use delegation_oracle::eligibility::evaluator::evaluate_validator;
@@ -152,6 +152,10 @@ enum Commands {
     Watch {
         #[arg(long, default_value_t = 60)]
         interval_secs: u64,
+        #[arg(long)]
+        vulnerability_interval_secs: Option<u64>,
+        #[arg(long)]
+        drift_interval_secs: Option<u64>,
         #[arg(long, default_value_t = 1)]
         iterations: u32,
     },
@@ -315,6 +319,8 @@ async fn main() -> Result<()> {
         }
         Commands::Watch {
             interval_secs,
+            vulnerability_interval_secs,
+            drift_interval_secs,
             iterations,
         } => {
             run_watch_loop(
@@ -322,8 +328,12 @@ async fn main() -> Result<()> {
                 &store,
                 &config,
                 &selected_programs,
-                &your_metrics,
+                &config.validator.vote_pubkey,
+                &config.rpc.url,
+                &metric_overrides,
                 *interval_secs,
+                *vulnerability_interval_secs,
+                *drift_interval_secs,
                 *iterations,
             )
             .await?;
@@ -464,8 +474,12 @@ async fn run_watch_loop(
     store: &SnapshotStore,
     config: &Config,
     selected: &[ProgramId],
-    your_metrics: &delegation_oracle::metrics::ValidatorMetrics,
+    vote_pubkey: &str,
+    rpc_url: &str,
+    metric_overrides: &MetricOverrides,
     interval_secs: u64,
+    vulnerability_interval_secs: Option<u64>,
+    drift_interval_secs: Option<u64>,
     iterations: u32,
 ) -> Result<()> {
     let mut previous_results: Option<Vec<EligibilityResult>> = None;
@@ -479,22 +493,58 @@ async fn run_watch_loop(
         )));
     }
 
+    let status_interval = Duration::from_secs(interval_secs.max(1));
+    let vulnerability_interval = Duration::from_secs(
+        vulnerability_interval_secs.unwrap_or_else(|| interval_secs.saturating_mul(5).max(60)),
+    );
+    let default_drift_secs = u64::from(config.analysis.drift_check_interval_hours)
+        .saturating_mul(3600)
+        .max(interval_secs.max(60));
+    let drift_interval = Duration::from_secs(drift_interval_secs.unwrap_or(default_drift_secs));
+
+    let mut last_vulnerability_scan: Option<Instant> = None;
+    let mut last_drift_scan: Option<Instant> = None;
+
     let total_iterations = iterations.max(1);
     for i in 0..total_iterations {
         info!("watch iteration {}", i + 1);
-        let (results, _, _) = evaluate_selected_programs(registry, selected, your_metrics).await?;
-        let drifts = run_drift_detection(registry, store, selected, your_metrics).await?;
-        let competitors = sample_competitors(your_metrics);
-        let criteria_sets = fetch_all_criteria(registry, Some(selected)).await?;
-        let mut vulnerabilities = Vec::new();
-        for set in criteria_sets {
-            vulnerabilities.extend(analyze_vulnerabilities(
-                set.program,
-                &set,
-                &competitors,
-                config.analysis.vulnerability_margin_pct,
-            ));
-        }
+        let mut live_metrics =
+            collect_validator_metrics(Some(vote_pubkey), rpc_url, metric_overrides).await?;
+        normalize_metrics(&mut live_metrics);
+
+        let (results, criteria_sets, _) =
+            evaluate_selected_programs(registry, selected, &live_metrics).await?;
+
+        let now = Instant::now();
+        let should_run_vulnerability = last_vulnerability_scan
+            .map(|last| now.duration_since(last) >= vulnerability_interval)
+            .unwrap_or(true);
+        let vulnerabilities = if should_run_vulnerability {
+            last_vulnerability_scan = Some(now);
+            let competitors = sample_competitors(&live_metrics);
+            let mut scan = Vec::new();
+            for set in &criteria_sets {
+                scan.extend(analyze_vulnerabilities(
+                    set.program,
+                    set,
+                    &competitors,
+                    config.analysis.vulnerability_margin_pct,
+                ));
+            }
+            scan
+        } else {
+            Vec::new()
+        };
+
+        let should_run_drift = last_drift_scan
+            .map(|last| now.duration_since(last) >= drift_interval)
+            .unwrap_or(true);
+        let drifts = if should_run_drift {
+            last_drift_scan = Some(now);
+            run_drift_detection(registry, store, selected, &live_metrics).await?
+        } else {
+            Vec::new()
+        };
 
         let alerts = evaluate_alerts(
             previous_results.as_deref(),
@@ -502,6 +552,7 @@ async fn run_watch_loop(
             &drifts,
             &vulnerabilities,
         );
+        let alerts = apply_alert_rules(alerts, config);
         for alert in &alerts {
             for sink in &sinks {
                 if let Err(err) = sink.send(alert).await {
@@ -509,14 +560,29 @@ async fn run_watch_loop(
                 }
             }
         }
-        persist_eligibility_history(store, &your_metrics.vote_pubkey, &results)?;
+        persist_eligibility_history(store, &live_metrics.vote_pubkey, &results)?;
         previous_results = Some(results);
 
         if i + 1 < total_iterations {
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            tokio::time::sleep(status_interval).await;
         }
     }
     Ok(())
+}
+
+fn apply_alert_rules(
+    alerts: Vec<delegation_oracle::alert::engine::AlertEvent>,
+    config: &Config,
+) -> Vec<delegation_oracle::alert::engine::AlertEvent> {
+    alerts
+        .into_iter()
+        .filter(|event| match event.kind {
+            AlertEventKind::CriteriaDrift => config.alerts.rules.criteria_drift,
+            AlertEventKind::VulnerabilityDetected => config.alerts.rules.vulnerability_detected,
+            AlertEventKind::EligibilityLost => config.alerts.rules.eligibility_lost,
+            AlertEventKind::EligibilityGained => config.alerts.rules.eligibility_gained,
+        })
+        .collect()
 }
 
 fn print_status(results: &[EligibilityResult], format: OutputFormat) -> Result<()> {

@@ -1,4 +1,5 @@
 pub mod blazestake;
+pub mod http;
 pub mod jito;
 pub mod jpool;
 pub mod marinade;
