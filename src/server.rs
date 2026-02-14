@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -29,7 +30,7 @@ use crate::metrics::normalize::normalize_metrics;
 use crate::optimizer::conflicts::detect_conflicts;
 use crate::optimizer::recommendations::build_recommendations;
 use crate::optimizer::whatif::simulate_whatif;
-use crate::optimizer::{MetricChange, OptimizationRecommendation, WhatIfResult};
+use crate::optimizer::{OptimizationRecommendation, WhatIfResult};
 use crate::programs::ProgramRegistry;
 use crate::snapshot::store::SnapshotStore;
 
@@ -433,8 +434,12 @@ async fn drift(
 ) -> ApiResult<DriftResponse> {
     let effective = resolve_effective_context(&state, &request.context)?;
     let metrics = collect_metrics(&effective).await?;
-    let store = open_store(&state)?;
-    let drifts = run_drift_detection(&state.registry, &store, &effective.programs, &metrics)
+    let drifts = run_drift_detection(
+        &state.registry,
+        state.db_path.as_path(),
+        &effective.programs,
+        &metrics,
+    )
         .await
         .map_err(ApiError::internal)?;
     Ok(ok(DriftResponse { drifts }))
@@ -506,7 +511,6 @@ async fn watch(
             .max(1),
     );
 
-    let store = open_store(&state)?;
     let mut run_results = Vec::new();
     let mut previous_results: Option<Vec<EligibilityResult>> = None;
     let mut last_vulnerability_scan: Option<Instant> = None;
@@ -518,8 +522,11 @@ async fn watch(
 
         let (results, criteria_sets, _) =
             evaluate_selected_programs(&state.registry, &effective.programs, &live_metrics).await?;
-        persist_eligibility_history(&store, &live_metrics.vote_pubkey, &results)
-            .map_err(ApiError::internal)?;
+        {
+            let store = open_store(&state)?;
+            persist_eligibility_history(&store, &live_metrics.vote_pubkey, &results)
+                .map_err(ApiError::internal)?;
+        }
 
         let now = Instant::now();
         let run_vulnerability = last_vulnerability_scan
@@ -547,7 +554,12 @@ async fn watch(
             .unwrap_or(true);
         let drifts = if run_drift {
             last_drift_scan = Some(now);
-            run_drift_detection(&state.registry, &store, &effective.programs, &live_metrics)
+            run_drift_detection(
+                &state.registry,
+                state.db_path.as_path(),
+                &effective.programs,
+                &live_metrics,
+            )
                 .await
                 .map_err(ApiError::internal)?
         } else {
@@ -706,7 +718,7 @@ fn persist_eligibility_history(
 
 async fn run_drift_detection(
     registry: &ProgramRegistry,
-    store: &SnapshotStore,
+    db_path: &Path,
     selected: &[ProgramId],
     your_metrics: &crate::metrics::ValidatorMetrics,
 ) -> Result<Vec<CriteriaDrift>> {
@@ -716,6 +728,7 @@ async fn run_drift_detection(
             continue;
         };
         let new_set = program.fetch_criteria().await?;
+        let store = SnapshotStore::open(db_path)?;
         let old_set = store.latest_criteria(*id)?;
         if let Some(old) = old_set {
             let before = evaluate_validator(
