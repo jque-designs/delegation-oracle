@@ -1,0 +1,46 @@
+[package]
+name = "delegation-oracle"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-program delegation scanner for Solana validators"
+license = "MIT"
+repository = "https://github.com/jque-designs/delegation-oracle"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Web framework
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Solana
+solana-sdk = "2.0"
+solana-client = "2.0"
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Caching (optional)
+# rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "delegation-oracle"
+path = "src/main.rs"
